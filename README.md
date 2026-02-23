@@ -62,8 +62,17 @@ To see changes in real-time as you code, you will run the frontend and backend s
 ##### 3. Connect FastAPI to the Frontend
 Ensure your main.py includes the following lines to serve the static files:  
 
-```from fastapi.staticfiles import StaticFiles
+```
+from fastapi.staticfiles import StaticFiles
 
 # Mount the 'dist' directory to the root URL
-app.mount("/", StaticFiles(directory="dist", html=True), name="static")```
+app.mount("/", StaticFiles(directory="dist", html=True), name="static")
+```
+##### 4. Run the final product
+Nagivate to the backend directory, run:  
+
+`unicorn main:app`  
+
+Now you can see the updates in action!
+
  
