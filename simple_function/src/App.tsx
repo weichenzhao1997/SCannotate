@@ -39,6 +39,7 @@ const App: React.FC = () => {
 
   // 2. Trigger backend call whenever k changes
   // slider changes -> state k changes -> triggers re-render, useEffect: run the fetchPrediction effect whenever k changes -> fetchPrediction: API call
+  // dependency array [k]: tells React only run this function if k has changed since the last render
   useEffect(() => {
     fetchPrediction(k);
   }, [k]);
