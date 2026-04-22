@@ -1,0 +1,22 @@
+name: scannotate
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - scanpy
+  - anndata
+  - leidenalg
+  - python-igraph
+  - lightgbm
+  - scikit-learn
+  - numpy
+  - scipy
+  - pandas
+  - pip
+  - pip:
+    - fastapi==0.109.0
+    - uvicorn==0.27.0
+    - pydantic==2.5.3
+    - python-multipart==0.0.6
+    - shap
