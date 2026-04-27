@@ -1,14 +1,24 @@
 from contextlib import asynccontextmanager
+import gzip
+import io
+import urllib.request
+
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import igraph  # verify python-igraph is present (required by leiden igraph flavor)
 import numpy as np
+from hdbscan import HDBSCAN
 import lightgbm as lgb
 import shap
 from sklearn.preprocessing import LabelEncoder
 import scanpy as sc
+
+
+PANGLAO_URL = (
+    "https://panglaodb.se/markers/PanglaoDB_markers_27_Mar_2020.tsv.gz"
+)
 
 
 
@@ -37,6 +47,26 @@ async def lifespan(app: FastAPI):
     sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
 
     app.state.adata = adata
+
+    # Download PanglaoDB human marker gene reference (human "Hs" entries only)
+    try:
+        with urllib.request.urlopen(PANGLAO_URL, timeout=30) as resp:
+            raw = resp.read()
+        with gzip.open(io.BytesIO(raw)) as f:
+            content = f.read().decode("utf-8")
+        marker_db: dict[str, set[str]] = {}
+        for line in content.splitlines()[1:]:
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            species, gene, cell_type = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if "Hs" in species and gene and cell_type:
+                marker_db.setdefault(cell_type, set()).add(gene)
+        app.state.marker_db = marker_db
+    except Exception:
+        app.state.marker_db = {}
+
+    app.state.annotations: dict = {}
     yield  # server runs here; cleanup (if any) goes after this line
 
 
@@ -51,41 +81,56 @@ app.add_middleware(
 
 
 class ClusterRequest(BaseModel):
-    resolution: float
-    algorithm: str = "leiden"  # "leiden" | "hdbscan"
+    resolution: float = 0.5
+    algorithm: str = "leiden"       # "leiden" | "hdbscan"
+    min_cluster_size: int = 50
+    min_samples: int = 5
 
 
 @app.post("/cluster")
 async def cluster(req: ClusterRequest):
     """
-    Re-run clustering at the requested resolution on the pre-processed AnnData
-    stored in app.state.  UMAP coordinates are computed once and reused on
-    subsequent calls (they depend only on the neighbor graph, not the labels).
+    Re-run clustering on the pre-processed AnnData stored in app.state.
+    Cluster labels are always written to adata.obs["labels"] so that
+    downstream endpoints (e.g. /shap) have a single stable key to read from.
 
     Returns:
         {
             "points": [{"x": float, "y": float, "cluster": str}, ...],
-            "n_clusters": int
+            "n_clusters": int,   # unique real-cluster count (excludes noise)
+            "n_noise": int       # cells labeled "-1" by HDBSCAN; 0 for Leiden
         }
     """
     adata = app.state.adata
 
-    sc.tl.leiden(adata, resolution=req.resolution, flavor="igraph", n_iterations=2)
+    if req.algorithm == "hdbscan":
+        X_pca = adata.obsm["X_pca"][:, :30]
+        clusterer = HDBSCAN(
+            min_cluster_size=req.min_cluster_size,
+            min_samples=req.min_samples,
+            core_dist_n_jobs=-1,
+        )
+        raw_labels = clusterer.fit_predict(X_pca)
+        adata.obs["labels"] = [str(l) for l in raw_labels]
+    else:
+        sc.tl.leiden(adata, resolution=req.resolution, flavor="igraph", n_iterations=2)
+        adata.obs["labels"] = adata.obs["leiden"].astype(str)
 
     if "X_umap" not in adata.obsm:
         sc.tl.umap(adata)
 
     xs = adata.obsm["X_umap"][:, 0].tolist()
     ys = adata.obsm["X_umap"][:, 1].tolist()
-    clusters = adata.obs["leiden"].tolist()
+    label_col = adata.obs["labels"]
 
     points = [
         {"x": x, "y": y, "cluster": c}
-        for x, y, c in zip(xs, ys, clusters)
+        for x, y, c in zip(xs, ys, label_col.tolist())
     ]
-    n_clusters = int(adata.obs["leiden"].nunique())
+    n_noise    = int((label_col == "-1").sum())
+    n_clusters = int(label_col[label_col != "-1"].nunique())
 
-    return {"points": points, "n_clusters": n_clusters}
+    return {"points": points, "n_clusters": n_clusters, "n_noise": n_noise}
 
 
 @app.post("/shap")
@@ -112,7 +157,11 @@ def shap_endpoint():
         }
     """
     adata = app.state.adata
-    labels = adata.obs["leiden"].to_numpy()  # Categorical → plain numpy array
+    # Use the unified "labels" column written by /cluster (works for both
+    # Leiden and HDBSCAN). Exclude noise cells ("-1") before training.
+    all_labels = adata.obs["labels"].to_numpy()
+    noise_mask = all_labels == "-1"
+    labels = all_labels[~noise_mask]
 
     # ── Cache check ──────────────────────────────────────────────────────────
     label_hash = hash(labels.tobytes())
@@ -120,11 +169,11 @@ def shap_endpoint():
     if cached is not None and cached["hash"] == label_hash:
         return cached["result"]
 
-    # ── Feature matrix ───────────────────────────────────────────────────────
+    # ── Feature matrix (noise rows already excluded via label mask) ──────────
     X = adata.X
     if hasattr(X, "toarray"):
         X = X.toarray()
-    X = np.asarray(X, dtype=np.float32)
+    X = np.asarray(X, dtype=np.float32)[~noise_mask]
 
     gene_names = list(adata.var_names)
 
@@ -170,6 +219,67 @@ def shap_endpoint():
     app.state.shap_cache = {"hash": label_hash, "result": result}
 
     return result
+
+
+class AnnotateRequest(BaseModel):
+    cluster_id: str
+
+
+@app.post("/annotate")
+def annotate(req: AnnotateRequest):
+    """
+    Given a cluster ID, return the top 5 cell-type suggestions from PanglaoDB
+    ranked by overlap between the cluster's top-50 expressed genes and each
+    cell type's known marker set.
+    """
+    adata = app.state.adata
+    marker_db: dict[str, set[str]] = getattr(app.state, "marker_db", {})
+
+    if not marker_db:
+        return {"cluster_id": req.cluster_id, "suggestions": []}
+
+    mask = adata.obs["labels"] == req.cluster_id
+    if not mask.any():
+        return {"cluster_id": req.cluster_id, "suggestions": []}
+
+    X_cluster = adata[mask].X
+    if hasattr(X_cluster, "toarray"):
+        X_cluster = X_cluster.toarray()
+    mean_expr = np.asarray(X_cluster, dtype=np.float32).mean(axis=0).flatten()
+
+    gene_names = list(adata.var_names)
+    top50_idx = np.argsort(mean_expr)[::-1][:50]
+    top50_genes = {gene_names[i] for i in top50_idx}
+
+    scores = []
+    for cell_type, markers in marker_db.items():
+        if not markers:
+            continue
+        overlap = len(top50_genes & markers) / len(markers)
+        if overlap > 0:
+            scores.append({"cell_type": cell_type, "score": round(overlap, 4)})
+
+    scores.sort(key=lambda x: x["score"], reverse=True)
+    return {"cluster_id": req.cluster_id, "suggestions": scores[:5]}
+
+
+class SaveAnnotationRequest(BaseModel):
+    cluster_id: str
+    label: str
+    status: str  # "confirmed" | "suggested" | "unannotated"
+
+
+@app.post("/annotations/save")
+def save_annotation(req: SaveAnnotationRequest):
+    if not hasattr(app.state, "annotations"):
+        app.state.annotations = {}
+    app.state.annotations[req.cluster_id] = {"label": req.label, "status": req.status}
+    return {"ok": True}
+
+
+@app.get("/annotations")
+def get_annotations():
+    return {"annotations": getattr(app.state, "annotations", {})}
 
 
 # Serve the compiled React app from the dist/ folder
