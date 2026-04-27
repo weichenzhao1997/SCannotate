@@ -1,13 +1,22 @@
 from contextlib import asynccontextmanager
 import gzip
 import io
+import os
+import pathlib
+import shutil
+import tempfile
 import urllib.request
+import zipfile
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+import anndata
 import igraph  # verify python-igraph is present (required by leiden igraph flavor)
+import pandas as pd
+import scipy.sparse
+from scipy.io import mmread
 import numpy as np
 from hdbscan import HDBSCAN
 import lightgbm as lgb
@@ -21,32 +30,25 @@ PANGLAO_URL = (
 )
 
 
+def preprocess(adata: sc.AnnData) -> sc.AnnData:
+    sc.pp.filter_cells(adata, min_genes=200)
+    sc.pp.filter_genes(adata, min_cells=3)
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(
+        adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
+    adata = adata[:, adata.var.highly_variable].copy()
+    sc.pp.scale(adata, max_value=10)
+    sc.tl.pca(adata, svd_solver="arpack")
+    sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
+    return adata
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load PBMC 3k and run the standard preprocessing pipeline once on startup.
-    # The resulting AnnData (with neighbor graph) is stored in app.state so it
-    # persists across requests without re-downloading or re-computing.
     adata = sc.datasets.pbmc3k()
-
-    # Quality-control filters
-    sc.pp.filter_cells(adata, min_genes=200)
-    sc.pp.filter_genes(adata, min_cells=3)
-
-    # Normalisation and log-transform
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-
-    # Select highly variable genes, then subset and scale for PCA
-    sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
-    adata = adata[:, adata.var.highly_variable].copy()
-    sc.pp.scale(adata, max_value=10)
-
-    # Dimensionality reduction and KNN graph (done once; leiden/UMAP reuse this)
-    sc.tl.pca(adata, svd_solver="arpack")
-    sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
-
-    app.state.adata = adata
+    app.state.adata = preprocess(adata)
+    app.state.dataset_name = "pbmc3k"
 
     # Download PanglaoDB human marker gene reference (human "Hs" entries only)
     try:
@@ -108,7 +110,6 @@ async def cluster(req: ClusterRequest):
         clusterer = HDBSCAN(
             min_cluster_size=req.min_cluster_size,
             min_samples=req.min_samples,
-            core_dist_n_jobs=-1,
         )
         raw_labels = clusterer.fit_predict(X_pca)
         adata.obs["labels"] = [str(l) for l in raw_labels]
@@ -187,7 +188,6 @@ def shap_endpoint():
         n_estimators=100,
         num_leaves=31,
         learning_rate=0.1,
-        n_jobs=-1,
         verbose=-1,
     )
     model.fit(X, y_encoded)
@@ -280,6 +280,133 @@ def save_annotation(req: SaveAnnotationRequest):
 @app.get("/annotations")
 def get_annotations():
     return {"annotations": getattr(app.state, "annotations", {})}
+
+
+class LoadDatasetRequest(BaseModel):
+    dataset: str
+
+
+@app.post("/load-dataset")
+async def load_dataset(req: LoadDatasetRequest):
+    if req.dataset != "pbmc3k":
+        raise HTTPException(status_code=400, detail=f"Unknown dataset: {req.dataset}")
+    adata = sc.datasets.pbmc3k()
+    app.state.adata = preprocess(adata)
+    app.state.dataset_name = "pbmc3k"
+    app.state.annotations = {}
+    return {
+        "ok": True,
+        "dataset": "pbmc3k",
+        "n_cells": int(app.state.adata.n_obs),
+        "n_genes": int(app.state.adata.n_vars),
+    }
+
+
+def _read_uploaded(tmp_path: str, filename: str) -> anndata.AnnData:
+    """Parse an uploaded file into AnnData. Supports .h5ad, .csv/.tsv, .mtx, .zip."""
+    ext = pathlib.Path(filename.lower()).suffix
+
+    if ext == '.h5ad':
+        return anndata.read_h5ad(tmp_path)
+
+    if ext in ('.csv', '.tsv'):
+        df = pd.read_csv(tmp_path, index_col=0, sep=None, engine='python')
+        # Transpose if more columns than rows (genes × cells → cells × genes)
+        if df.shape[1] > df.shape[0]:
+            df = df.T
+        return anndata.AnnData(
+            X=np.asarray(df.values, dtype=np.float32),
+            obs=pd.DataFrame(index=df.index.astype(str)),
+            var=pd.DataFrame(index=df.columns.astype(str)),
+        )
+
+    if ext == '.mtx':
+        mat = mmread(tmp_path)
+        X = mat.toarray() if scipy.sparse.issparse(mat) else np.asarray(mat)
+        X = X.astype(np.float32)
+        # MTX convention is genes × cells; transpose if rows > cols
+        if X.shape[0] > X.shape[1]:
+            X = X.T
+        n_obs, n_vars = X.shape
+        return anndata.AnnData(
+            X=X,
+            obs=pd.DataFrame(index=[f'cell_{i}' for i in range(n_obs)]),
+            var=pd.DataFrame(index=[f'gene_{i}' for i in range(n_vars)]),
+        )
+
+    if ext == '.zip':
+        tmpdir = tempfile.mkdtemp()
+        try:
+            with zipfile.ZipFile(tmp_path) as zf:
+                zf.extractall(tmpdir)
+            mtx_files = list(pathlib.Path(tmpdir).rglob('*.mtx*'))
+            if not mtx_files:
+                raise ValueError("No .mtx file found in the zip archive.")
+            return sc.read_10x_mtx(
+                str(mtx_files[0].parent), var_names='gene_symbols', cache=False,
+            )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    raise ValueError(
+        f"Unsupported format '{ext}'. Accepted: .h5ad, .csv, .tsv, .mtx, .zip"
+    )
+
+
+@app.post("/upload-dataset")
+async def upload_dataset(file: UploadFile = File(...)):
+    filename = file.filename or "upload"
+    ext = pathlib.Path(filename.lower()).suffix
+    allowed = {'.h5ad', '.csv', '.tsv', '.mtx', '.zip'}
+    if ext not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format '{ext}'. Accepted: .h5ad, .csv, .tsv, .mtx, .zip",
+        )
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        contents = await file.read()
+        tmp.write(contents)
+        tmp_path = tmp.name
+
+    try:
+        adata = _read_uploaded(tmp_path, filename)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not read file: {str(e)}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    if adata.n_obs < 50:
+        raise HTTPException(status_code=422, detail="Dataset must contain at least 50 cells.")
+    if adata.n_vars < 100:
+        raise HTTPException(status_code=422, detail="Dataset must contain at least 100 genes.")
+
+    try:
+        app.state.adata = preprocess(adata)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Preprocessing failed: {str(e)}")
+
+    app.state.dataset_name = filename
+    app.state.annotations = {}
+
+    return {
+        "ok": True,
+        "dataset": filename,
+        "n_cells": int(app.state.adata.n_obs),
+        "n_genes": int(app.state.adata.n_vars),
+    }
+
+
+@app.get("/dataset-info")
+def dataset_info():
+    return {
+        "dataset": getattr(app.state, "dataset_name", "pbmc3k"),
+        "n_cells": int(app.state.adata.n_obs),
+        "n_genes": int(app.state.adata.n_vars),
+    }
 
 
 # Serve the compiled React app from the dist/ folder
