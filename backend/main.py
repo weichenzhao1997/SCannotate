@@ -294,6 +294,7 @@ async def load_dataset(req: LoadDatasetRequest):
     app.state.adata = preprocess(adata)
     app.state.dataset_name = "pbmc3k"
     app.state.annotations = {}
+    app.state.shap_cache = None
     return {
         "ok": True,
         "dataset": "pbmc3k",
@@ -302,8 +303,47 @@ async def load_dataset(req: LoadDatasetRequest):
     }
 
 
+def _looks_like_cell_id(values: pd.Index) -> bool:
+    sample = [str(v) for v in values[: min(len(values), 50)]]
+    if not sample:
+        return False
+    hits = sum(
+        ("-" in v) or ("_" in v) or (":" in v) or v.lower().startswith("cell")
+        for v in sample
+    )
+    return hits >= max(3, len(sample) // 3)
+
+
+def _looks_like_gene_name(values: pd.Index) -> bool:
+    sample = [str(v) for v in values[: min(len(values), 50)]]
+    if not sample:
+        return False
+    hits = sum(
+        v.lower().startswith("gene")
+        or v.startswith("ENSG")
+        or v.replace(".", "").replace("-", "").isalnum()
+        for v in sample
+    )
+    return hits >= max(3, len(sample) // 2)
+
+
+def _should_transpose_tabular(df: pd.DataFrame) -> bool:
+    row_cells = _looks_like_cell_id(df.index)
+    col_cells = _looks_like_cell_id(df.columns)
+    row_genes = _looks_like_gene_name(df.index)
+    col_genes = _looks_like_gene_name(df.columns)
+
+    # Prefer explicit label evidence over shape. Ambiguous inputs stay as-is,
+    # because the documented/default CSV/TSV layout is cells x genes.
+    if row_genes and col_cells and not row_cells:
+        return True
+    if row_cells and col_genes:
+        return False
+    return False
+
+
 def _read_uploaded(tmp_path: str, filename: str) -> anndata.AnnData:
-    """Parse an uploaded file into AnnData. Supports .h5ad, .csv/.tsv, .mtx, .zip."""
+    """Parse an uploaded file into AnnData. Supports .h5ad, .csv/.tsv, .zip."""
     ext = pathlib.Path(filename.lower()).suffix
 
     if ext == '.h5ad':
@@ -311,8 +351,7 @@ def _read_uploaded(tmp_path: str, filename: str) -> anndata.AnnData:
 
     if ext in ('.csv', '.tsv'):
         df = pd.read_csv(tmp_path, index_col=0, sep=None, engine='python')
-        # Transpose if more columns than rows (genes × cells → cells × genes)
-        if df.shape[1] > df.shape[0]:
+        if _should_transpose_tabular(df):
             df = df.T
         return anndata.AnnData(
             X=np.asarray(df.values, dtype=np.float32),
@@ -320,19 +359,6 @@ def _read_uploaded(tmp_path: str, filename: str) -> anndata.AnnData:
             var=pd.DataFrame(index=df.columns.astype(str)),
         )
 
-    if ext == '.mtx':
-        mat = mmread(tmp_path)
-        X = mat.toarray() if scipy.sparse.issparse(mat) else np.asarray(mat)
-        X = X.astype(np.float32)
-        # MTX convention is genes × cells; transpose if rows > cols
-        if X.shape[0] > X.shape[1]:
-            X = X.T
-        n_obs, n_vars = X.shape
-        return anndata.AnnData(
-            X=X,
-            obs=pd.DataFrame(index=[f'cell_{i}' for i in range(n_obs)]),
-            var=pd.DataFrame(index=[f'gene_{i}' for i in range(n_vars)]),
-        )
 
     if ext == '.zip':
         tmpdir = tempfile.mkdtemp()
@@ -349,7 +375,7 @@ def _read_uploaded(tmp_path: str, filename: str) -> anndata.AnnData:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     raise ValueError(
-        f"Unsupported format '{ext}'. Accepted: .h5ad, .csv, .tsv, .mtx, .zip"
+        f"Unsupported format '{ext}'. Accepted: .h5ad, .csv, .tsv, .zip"
     )
 
 
@@ -357,11 +383,11 @@ def _read_uploaded(tmp_path: str, filename: str) -> anndata.AnnData:
 async def upload_dataset(file: UploadFile = File(...)):
     filename = file.filename or "upload"
     ext = pathlib.Path(filename.lower()).suffix
-    allowed = {'.h5ad', '.csv', '.tsv', '.mtx', '.zip'}
+    allowed = {'.h5ad', '.csv', '.tsv', '.zip'}
     if ext not in allowed:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported format '{ext}'. Accepted: .h5ad, .csv, .tsv, .mtx, .zip",
+            detail=f"Unsupported format '{ext}'. Accepted: .h5ad, .csv, .tsv, .zip",
         )
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
@@ -391,6 +417,7 @@ async def upload_dataset(file: UploadFile = File(...)):
 
     app.state.dataset_name = filename
     app.state.annotations = {}
+    app.state.shap_cache = None
 
     return {
         "ok": True,
