@@ -1,0 +1,8 @@
+Recommended setup:
+
+
+conda create -n scannotate python=3.11
+conda activate scannotate
+
+set up environment.yml file and run
+conda env create -f environment.yml

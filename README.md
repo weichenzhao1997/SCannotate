@@ -102,5 +102,6 @@ The Vite config proxies `/cluster`, `/shap`, `/annotate`, and `/annotations` to 
 | `POST` | `/annotate` | Return top-5 PanglaoDB cell type suggestions for a cluster |
 | `POST` | `/annotations/save` | Persist a user-confirmed or suggested label for a cluster |
 | `GET`  | `/annotations` | Retrieve all saved annotations for the current session |
+| `POST` | `/upload-dataset` | Upload a custom dataset (`.h5ad`, `.csv`, `.tsv`, `.zip`) to replace the default PBMC 3k data |
 
 Interactive API documentation is available at [http://localhost:8000/docs](http://localhost:8000/docs) while the server is running.

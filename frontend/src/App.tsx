@@ -8,6 +8,7 @@ interface ShapGene   { gene: string; shap: number; }
 interface Suggestion { cell_type: string; score: number; }
 type ShapData    = Record<string, ShapGene[]>;
 type Annotations = Record<string, { label: string; status: string }>;
+type ExportKind  = 'annotations' | 'umap' | 'h5ad';
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -29,8 +30,8 @@ const ALGO_ACTIVE_COLOR: Record<string, string> = {
 };
 
 const ALGO_HINT: Record<string, string> = {
-  leiden:  'Leiden offers better community detection & is generally faster',
-  hdbscan: 'HDBSCAN finds clusters of arbitrary shape without a fixed resolution',
+  leiden:  'A community detection method to group cells with similar experssion profiles by iteratively optimizing the modularity of a KNN graph',
+  hdbscan: 'A density-based method that identifies cell clusters of varying shapes and densities, allowing it to detect "noise" cells that do not fit into any clear group',
 };
 
 // ── Shared styles ──────────────────────────────────────────────────────────
@@ -377,12 +378,18 @@ const App: React.FC = () => {
   const [datasetName, setDatasetName]         = useState<string>('PBMC 3k (built-in)');
   const [datasetInfo, setDatasetInfo]         = useState<{ n_cells: number; n_genes: number } | null>(null);
   const [showImportModal, setShowImportModal] = useState<boolean>(false);
+  const [showExportModal, setShowExportModal] = useState<boolean>(false);
   const [importLoading, setImportLoading]     = useState<boolean>(false);
   const [importError, setImportError]         = useState<string | null>(null);
   const [selectedBuiltin, setSelectedBuiltin] = useState<string>('pbmc3k');
   const [importTab, setImportTab]             = useState<'builtin' | 'upload'>('builtin');
   const [uploadFile, setUploadFile]           = useState<File | null>(null);
   const [dragOver, setDragOver]               = useState<boolean>(false);
+  const [exportLoading, setExportLoading]     = useState<Record<ExportKind, boolean>>({
+    annotations: false,
+    umap: false,
+    h5ad: false,
+  });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Onboarding state
@@ -403,16 +410,32 @@ const App: React.FC = () => {
     setOnboardingStep(step);
   };
 
+  const downloadFromEndpoint = async (url: string, filename: string) => {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Download failed: ${response.status}`);
+    }
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(objectUrl);
+  };
+
   // ── Effects ────────────────────────────────────────────────────────────
 
   // Mount: data fetches + onboarding check
   useEffect(() => {
     fetchCluster(resolution, algorithm, minClusterSize, minSamples);
-    fetch('http://localhost:8000/annotations')
+    fetch('/annotations')
       .then(r => r.json())
       .then(d => setAnnotations(d.annotations ?? {}))
       .catch(() => {});
-    fetch('http://localhost:8000/dataset-info')
+    fetch('/dataset-info')
       .then(r => r.json())
       .then(d => {
         setDatasetName(d.dataset === 'pbmc3k' ? 'PBMC 3k (built-in)' : d.dataset);
@@ -459,7 +482,7 @@ const App: React.FC = () => {
     setSelectedCluster(null);
     setSuggestions([]);
     try {
-      const response = await fetch('http://localhost:8000/cluster', {
+      const response = await fetch('/cluster', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -490,7 +513,7 @@ const App: React.FC = () => {
     setSelectedCluster(clusterId);
     setSuggestionsLoading(true);
     try {
-      const resp = await fetch('http://localhost:8000/annotate', {
+      const resp = await fetch('/annotate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cluster_id: clusterId }),
@@ -512,7 +535,7 @@ const App: React.FC = () => {
       [selectedCluster]: { label: cellType, status: 'confirmed' },
     }));
     try {
-      await fetch('http://localhost:8000/annotations/save', {
+      await fetch('/annotations/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cluster_id: selectedCluster, label: cellType, status: 'confirmed' }),
@@ -531,7 +554,7 @@ const App: React.FC = () => {
     }));
     setAnnotationInput('');
     try {
-      await fetch('http://localhost:8000/annotations/save', {
+      await fetch('/annotations/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cluster_id: selectedCluster, label, status: 'confirmed' }),
@@ -544,7 +567,7 @@ const App: React.FC = () => {
   const fetchShap = async () => {
     setShapLoading(true);
     try {
-      const response = await fetch('http://localhost:8000/shap', { method: 'POST' });
+      const response = await fetch('/shap', { method: 'POST' });
       const result = await response.json();
       setShapData(result.clusters);
       setShapStale(false);
@@ -616,7 +639,7 @@ const App: React.FC = () => {
     setImportLoading(true);
     setImportError(null);
     try {
-      const resp = await fetch('http://localhost:8000/load-dataset', {
+      const resp = await fetch('/load-dataset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dataset: selectedBuiltin }),
@@ -646,7 +669,7 @@ const App: React.FC = () => {
     try {
       const formData = new FormData();
       formData.append('file', uploadFile);
-      const resp = await fetch('http://localhost:8000/upload-dataset', {
+      const resp = await fetch('/upload-dataset', {
         method: 'POST',
         body: formData,
       });
@@ -660,12 +683,24 @@ const App: React.FC = () => {
       setDatasetInfo({ n_cells: data.n_cells, n_genes: data.n_genes });
       setShowImportModal(false);
       setUploadFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
       resetDatasetState();
       fetchCluster(resolution, algorithm, minClusterSize, minSamples);
     } catch {
       setImportError('Network error. Is the backend running?');
     } finally {
       setImportLoading(false);
+    }
+  };
+
+  const handleExport = async (kind: ExportKind, url: string, filename: string) => {
+    setExportLoading(prev => ({ ...prev, [kind]: true }));
+    try {
+      await downloadFromEndpoint(url, filename);
+    } catch (error) {
+      console.error('Export failed.', error);
+    } finally {
+      setExportLoading(prev => ({ ...prev, [kind]: false }));
     }
   };
 
@@ -677,6 +712,12 @@ const App: React.FC = () => {
       ...Object.keys(annotations).filter(id => id !== '-1'),
     ]),
   ).sort((a, b) => parseInt(a) - parseInt(b));
+  const currentClusterIds = Array.from(activeClusterIds).sort((a, b) => parseInt(a) - parseInt(b));
+  const confirmedClusters = currentClusterIds.filter(
+    id => annotations[id]?.status === 'confirmed',
+  ).length;
+  const hasCompletenessWarning =
+    nClusters !== null && confirmedClusters < nClusters / 2;
 
   // ── Render ─────────────────────────────────────────────────────────────
 
@@ -736,11 +777,23 @@ const App: React.FC = () => {
           }}
         >?</button>
         <button
+          onClick={() => setShowExportModal(true)}
+          style={{
+            padding: '5px 12px', fontSize: '12px',
+            background: '#fff', color: '#444',
+            border: '1px solid #ddd', borderRadius: '6px',
+            cursor: 'pointer', fontFamily: 'inherit',
+          }}
+        >
+          Save session
+        </button>
+        <button
           onClick={() => {
             setShowImportModal(true);
             setImportError(null);
             setImportTab('builtin');
             setUploadFile(null);
+            if (fileInputRef.current) fileInputRef.current.value = '';
           }}
           style={{
             padding: '5px 12px', fontSize: '12px',
@@ -752,6 +805,190 @@ const App: React.FC = () => {
           Load Data
         </button>
       </div>
+
+      {/* ── Export modal ── */}
+      {showExportModal && (
+        <div style={{
+          position: 'fixed', inset: 0,
+          background: 'rgba(0,0,0,0.4)', zIndex: 1000,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <div style={{
+            background: '#fff', borderRadius: '12px',
+            padding: '28px 32px', width: '520px', maxWidth: '90vw',
+            boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
+            position: 'relative',
+          }}>
+            <button
+              onClick={() => setShowExportModal(false)}
+              style={{
+                position: 'absolute', top: '16px', right: '20px',
+                fontSize: '18px', color: '#888', cursor: 'pointer',
+                background: 'none', border: 'none', lineHeight: 1,
+                fontFamily: 'inherit',
+              }}
+            >×</button>
+
+            <div style={{ fontSize: '16px', fontWeight: 500, marginBottom: '16px' }}>
+              Export results
+            </div>
+
+            {hasCompletenessWarning && (
+              <div style={{
+                marginBottom: '12px',
+                background: '#E1F5EE',
+                border: '1px solid #5DCAA5',
+                color: '#085041',
+                borderRadius: '6px',
+                padding: '8px 10px',
+                fontSize: '12px',
+                lineHeight: '1.6',
+              }}>
+                Some clusters are not yet annotated. You can still export — unannotated clusters will be labeled 'unannotated' in the output.
+              </div>
+            )}
+
+            <div style={{
+              background: '#f8f8f8',
+              borderRadius: '8px',
+              padding: '12px 14px',
+              fontSize: '12px',
+              color: '#555',
+              lineHeight: 1.8,
+              marginBottom: '14px',
+            }}>
+              <div>Dataset: {datasetName}</div>
+              <div>Cells: {datasetInfo?.n_cells.toLocaleString() ?? '—'}</div>
+              <div>Clusters: {nClusters ?? '—'}</div>
+              <div>
+                Annotated: {confirmedClusters} / {nClusters ?? '—'} clusters confirmed
+              </div>
+            </div>
+
+            <div style={{
+              border: '0.5px solid #e0e0e0',
+              borderRadius: '8px',
+              padding: '12px 14px',
+              marginBottom: '10px',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                  <span style={{ fontSize: '15px', lineHeight: 1 }}>⊞</span>
+                  <span style={{ fontSize: '13px', fontWeight: 500, color: '#222' }}>Annotations CSV</span>
+                </div>
+                <button
+                  onClick={() => handleExport('annotations', '/export/annotations-csv', 'scannotate_annotations.csv')}
+                  disabled={exportLoading.annotations}
+                  style={{
+                    padding: '5px 12px',
+                    fontSize: '12px',
+                    background: exportLoading.annotations ? '#8CCFB8' : '#1D9E75',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: '6px',
+                    cursor: exportLoading.annotations ? 'not-allowed' : 'pointer',
+                    fontFamily: 'inherit',
+                    flexShrink: 0,
+                  }}
+                >
+                  {exportLoading.annotations ? 'Downloading...' : 'Download CSV'}
+                </button>
+              </div>
+              <div style={{ fontSize: '12px', color: '#777', lineHeight: '1.6', marginTop: '8px' }}>
+                Cluster IDs, cell type labels, annotation status, and cell counts. Import into Excel or R.
+              </div>
+            </div>
+
+            <div style={{
+              border: '0.5px solid #e0e0e0',
+              borderRadius: '8px',
+              padding: '12px 14px',
+              marginBottom: '10px',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                  <span style={{ fontSize: '15px', lineHeight: 1 }}>• • •</span>
+                  <span style={{ fontSize: '13px', fontWeight: 500, color: '#222' }}>UMAP coordinates CSV</span>
+                </div>
+                <button
+                  onClick={() => handleExport('umap', '/export/umap-csv', 'scannotate_umap.csv')}
+                  disabled={exportLoading.umap}
+                  style={{
+                    padding: '5px 12px',
+                    fontSize: '12px',
+                    background: exportLoading.umap ? '#8CCFB8' : '#1D9E75',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: '6px',
+                    cursor: exportLoading.umap ? 'not-allowed' : 'pointer',
+                    fontFamily: 'inherit',
+                    flexShrink: 0,
+                  }}
+                >
+                  {exportLoading.umap ? 'Downloading...' : 'Download CSV'}
+                </button>
+              </div>
+              <div style={{ fontSize: '12px', color: '#777', lineHeight: '1.6', marginTop: '8px' }}>
+                Per-cell UMAP coordinates, cluster ID, and cell type label. Ready for plotting in Python or R.
+              </div>
+            </div>
+
+            <div style={{
+              border: '0.5px solid #e0e0e0',
+              borderRadius: '8px',
+              padding: '12px 14px',
+              marginBottom: '14px',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                  <span style={{ fontSize: '15px', lineHeight: 1 }}>🗄</span>
+                  <span style={{ fontSize: '13px', fontWeight: 500, color: '#222' }}>Full AnnData (.h5ad)</span>
+                </div>
+                <button
+                  onClick={() => handleExport('h5ad', '/export/full-h5ad', 'scannotate_results.h5ad')}
+                  disabled={exportLoading.h5ad}
+                  style={{
+                    padding: '5px 12px',
+                    fontSize: '12px',
+                    background: exportLoading.h5ad ? '#B8B2EB' : '#7F77DD',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: '6px',
+                    cursor: exportLoading.h5ad ? 'not-allowed' : 'pointer',
+                    fontFamily: 'inherit',
+                    flexShrink: 0,
+                  }}
+                >
+                  {exportLoading.h5ad ? 'Downloading...' : 'Download .h5ad'}
+                </button>
+              </div>
+              <div style={{ fontSize: '12px', color: '#777', lineHeight: '1.6', marginTop: '8px' }}>
+                Complete analysis object including expression matrix, embeddings, clustering, and annotations. Load directly into Scanpy or AnnData.
+              </div>
+              <div style={{ fontSize: '11px', color: '#633806', marginTop: '8px', lineHeight: '1.5' }}>
+                ⚠ File size may be large depending on dataset.
+              </div>
+            </div>
+
+            <button
+              onClick={() => setShowExportModal(false)}
+              style={{
+                width: '100%',
+                padding: '10px',
+                background: '#fff',
+                color: '#666',
+                border: '1px solid #ddd',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+                fontSize: '13px',
+              }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── Onboarding modal ── */}
       {showOnboarding && (
@@ -980,11 +1217,6 @@ const App: React.FC = () => {
                       desc: 'Plain count matrix with cells as rows and genes as columns (or genes × cells — the tool auto-detects orientation). First row = gene names, first column = cell barcodes.',
                     },
                     {
-                      fmt: '.mtx',
-                      color: '#633806', bg: '#FAEEDA',
-                      desc: 'Sparse Matrix Market format produced by tools like Cell Ranger or STARsolo. Gene names default to gene_0, gene_1, … unless supplied via a separate barcodes/features file.',
-                    },
-                    {
                       fmt: '.zip',
                       color: '#0C447C', bg: '#E6F1FB',
                       desc: '10x Genomics bundle — zip the folder containing matrix.mtx(.gz), barcodes.tsv(.gz), and features.tsv(.gz). Gene symbols are used automatically.',
@@ -1029,17 +1261,18 @@ const App: React.FC = () => {
                   <span style={{ fontSize: '24px', color: '#888', display: 'block', marginBottom: '8px' }}>↑</span>
                   <div style={{ fontSize: '13px', color: '#555' }}>Drag and drop your file here</div>
                   <div style={{ fontSize: '12px', color: '#aaa', marginTop: '4px' }}>
-                    .h5ad · .csv · .tsv · .mtx · .zip (10x)
+                    .h5ad · .csv · .tsv · .zip (10x)
                   </div>
                   <div style={{ fontSize: '12px', color: '#888', marginTop: '4px' }}>or click to browse</div>
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept=".h5ad,.csv,.tsv,.mtx,.zip"
+                    accept=".h5ad,.csv,.tsv,.zip"
                     style={{ display: 'none' }}
                     onChange={e => {
                       const f = e.target.files?.[0];
                       if (f) setUploadFile(f);
+                      e.target.value = '';
                     }}
                   />
                 </div>
@@ -1128,7 +1361,12 @@ const App: React.FC = () => {
                   value={resolution} onChange={handleSliderChange}
                   style={{ width: '100%' }}
                 />
-                <div style={hintBox}>Controls granularity of clustering. Try 0.4–1.2 for most datasets.</div>
+                <div style={hintBox}>
+                  Controls granularity of clustering. Controls the balance between finding many small, highly specific communities vs a few large, broad ones.<br />
+                  Low resolution (0.1–0.4): prioritizes larger, more global structures.<br />
+                  High resolution (1.0–2.0): more sensitive to local densities, breaking larger groups into smaller subsets.<br />
+                  Try 0.4–1.2 for most datasets.
+                </div>
               </>
             ) : (
               <>
@@ -1178,7 +1416,7 @@ const App: React.FC = () => {
             )}
           </section>
 
-          <section>
+          {/* <section>
             <span style={sectionLabel}>Cluster Tools</span>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
               <button style={{
@@ -1198,7 +1436,7 @@ const App: React.FC = () => {
                 Lasso split
               </button>
             </div>
-          </section>
+          </section> */}
 
           {nClusters !== null && (
             <section>
@@ -1257,12 +1495,7 @@ const App: React.FC = () => {
             )}
           </div>
 
-          <div style={{
-            textAlign: 'center', fontSize: '11px',
-            color: '#bbb', padding: '8px 0 10px', flexShrink: 0,
-          }}>
-            Click a cluster to inspect · Lasso to split
-          </div>
+          
         </div>
 
         {/* ── Right panel ── */}
