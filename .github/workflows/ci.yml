@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+        shell: bash -el {0}  # login shell so the micromamba env is active
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: backend/environment.yml
+          cache-environment: true
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        run: pytest -v
+
+  frontend:
+    name: Frontend lint & build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build  # tsc type-check + vite build into backend/dist
+
+      # The backend serves the committed backend/dist bundle, so a change to
+      # frontend/src without a rebuild would never reach users.
+      - name: Check committed bundle is up to date
+        run: |
+          if [ -n "$(git status --porcelain -- ../backend/dist)" ]; then
+            git status --short -- ../backend/dist
+            echo "::error::backend/dist is stale. Run 'npm run build' in frontend/ and commit the result."
+            exit 1
+          fi
