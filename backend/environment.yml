@@ -8,6 +8,7 @@ dependencies:
   - anndata
   - leidenalg
   - python-igraph
+  - hdbscan
   - lightgbm
   - scikit-learn
   - numpy

@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 import gzip
+import hashlib
 import io
 import os
 import pathlib
@@ -168,7 +169,9 @@ def shap_endpoint():
     labels = all_labels[~noise_mask]
 
     # ── Cache check ──────────────────────────────────────────────────────────
-    label_hash = hash(labels.tobytes())
+    # Hash the label strings themselves; labels is an object array, so
+    # labels.tobytes() would hash memory addresses rather than contents.
+    label_hash = hashlib.sha256("\0".join(labels).encode()).hexdigest()
     cached = getattr(app.state, "shap_cache", None)
     if cached is not None and cached["hash"] == label_hash:
         return cached["result"]
@@ -203,6 +206,11 @@ def shap_endpoint():
     # Normalise to 3-D so the indexing below is version-independent.
     if isinstance(shap_values, list):
         shap_values = np.stack(shap_values, axis=-1)  # → (n_cells, n_genes, n_classes)
+    # With exactly two clusters LightGBM trains a binary model and SHAP returns
+    # a single (n_cells, n_genes) array for the positive class; the negative
+    # class's log-odds contributions are its mirror image.
+    if shap_values.ndim == 2:
+        shap_values = np.stack([-shap_values, shap_values], axis=-1)
 
     # ── Top-10 genes per cluster ─────────────────────────────────────────────
     clusters_out: dict[str, list[dict]] = {}
@@ -547,4 +555,8 @@ def export_umap_csv():
 
 
 # Serve the compiled React app from the dist/ folder
-app.mount("/", StaticFiles(directory="dist", html=True), name="static")
+app.mount(
+    "/",
+    StaticFiles(directory=pathlib.Path(__file__).parent / "dist", html=True),
+    name="static",
+)

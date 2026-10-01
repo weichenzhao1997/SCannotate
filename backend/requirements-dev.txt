@@ -1,0 +1,4 @@
+# Test-only dependencies (install on top of environment.yml or requirements.txt)
+pytest>=8
+# Starlette's TestClient in fastapi 0.109 is incompatible with httpx 0.28+
+httpx>=0.25,<0.28
