@@ -30,7 +30,7 @@ SCannotate provides three tightly coupled points of interaction:
 
 ### Python environment
 
-Python 3.9+ is required. The recommended setup uses conda:
+Python 3.11+ is required. The recommended setup uses conda:
 
 ```bash
 conda env create -f backend/environment.yml
@@ -91,7 +91,24 @@ cd frontend && npm run dev
 # UI available at http://localhost:5173
 ```
 
-The Vite config proxies `/cluster`, `/shap`, `/annotate`, and `/annotations` to the backend automatically.
+The Vite config proxies the API routes (`/cluster`, `/shap`, `/annotate`, `/annotations`, `/load-dataset`, `/upload-dataset`, `/dataset-info`, `/export`) to the backend automatically.
+
+## Testing
+
+Backend tests use a small synthetic dataset with three known cell groups, so they run offline in about 20 seconds (no PBMC 3k or PanglaoDB download):
+
+```bash
+cd backend
+pip install -r requirements-dev.txt   # pytest + httpx, on top of environment.yml
+pytest
+```
+
+They cover preprocessing, file parsing (`.h5ad`, CSV/TSV orientation, 10x `.zip`), every endpoint, and check that clustering, SHAP driver genes, and marker-based suggestions recover the planted groups.
+
+GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every push to `main` and on pull requests:
+
+- **Backend**: builds the conda environment from `environment.yml` and runs `pytest`
+- **Frontend**: `npm run lint`, then `npm run build` (type-check + bundle), and fails if the committed `backend/dist/` doesn't match the fresh build
 
 ## API Reference
 
