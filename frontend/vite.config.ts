@@ -12,6 +12,7 @@ export default defineConfig({
       '/load-dataset':   'http://127.0.0.1:8000',
       '/upload-dataset': 'http://127.0.0.1:8000',
       '/dataset-info':   'http://127.0.0.1:8000',
+      '/export':         'http://127.0.0.1:8000',
     },
   },
   build: {

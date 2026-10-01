@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Plot from 'react-plotly.js';
+import type { PlotMouseEvent } from 'plotly.js';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -616,7 +617,7 @@ const App: React.FC = () => {
     fetchCluster(resolution, alg, minClusterSize, minSamples);
   };
 
-  const handlePlotClick = (event: any) => {
+  const handlePlotClick = (event: Readonly<PlotMouseEvent>) => {
     if (!event?.points?.length) return;
     const traceName: string = event.points[0].data.name;
     if (traceName === 'Noise') return;
